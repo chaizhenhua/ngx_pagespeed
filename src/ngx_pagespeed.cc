@@ -59,6 +59,7 @@ extern "C" {
 #include "net/instaweb/util/public/string.h"
 #include "net/instaweb/util/public/string_writer.h"
 #include "net/instaweb/util/public/time_util.h"
+#include "net/instaweb/util/stack_buffer.h"
 
 extern ngx_module_t ngx_pagespeed;
 
@@ -1341,16 +1342,13 @@ void ps_send_to_pagespeed(ngx_http_request_t* r,
           StringPiece(reinterpret_cast<char*>(cur->buf->pos),
                       cur->buf->last - cur->buf->pos), cfg_s->handler);
     } else {
-      // TODO(oschaaf): get stack buffer size
-      size_t kStackBufferSize = 1024*8;
-      char buf[kStackBufferSize];
-      ctx->inflater_->SetInput(
-          reinterpret_cast<char*>(cur->buf->pos),
-          cur->buf->last - cur->buf->pos);
+      char buf[net_instaweb::kStackBufferSize];
+      ctx->inflater_->SetInput(reinterpret_cast<char*>(cur->buf->pos),
+                               cur->buf->last - cur->buf->pos);
       while (ctx->inflater_->HasUnconsumedInput()) {
-        int num_inflated_bytes =
-            ctx->inflater_->InflateBytes(buf, kStackBufferSize);
-        DCHECK_LE(0, num_inflated_bytes) << "Corrupted zip inflation";
+        int num_inflated_bytes = ctx->inflater_->InflateBytes(
+            buf, net_instaweb::kStackBufferSize);
+        DCHECK_LE(0, num_inflated_bytes) << "Corrupted inflation";
         if (num_inflated_bytes > 0) {
           ctx->proxy_fetch->Write(StringPiece(buf, num_inflated_bytes),
                                   cfg_s->handler);
@@ -1548,12 +1546,28 @@ ngx_int_t ps_header_filter(ngx_http_request_t* r) {
 
   if (r->headers_out.content_encoding &&
       r->headers_out.content_encoding->value.len) {
-    r->headers_out.content_encoding->hash = 0;
-    // TODO(oschaaf): log a single warning about this.
-    fprintf(stderr, "cleared content encoding header\n");
-    ctx->inflater_ = new net_instaweb::GzipInflater(
-        net_instaweb::GzipInflater::kDeflate);
-    ctx->inflater_->Init();
+    StringPiece content_encoding =
+        str_to_string_piece(r->headers_out.content_encoding->value);
+    net_instaweb::GzipInflater::InflateType inflate_type;
+    bool is_encoded = false;
+    // TODO(oschaaf): test stacked encodings. if
+    // nginx coalesces headers here, we should be fine.
+    if (net_instaweb::StringCaseEqual(content_encoding, "deflate")) {
+      is_encoded = true;
+      inflate_type = net_instaweb::GzipInflater::kDeflate;
+    } else if (net_instaweb::StringCaseEqual(content_encoding, "gzip")) {
+      is_encoded = true;
+      inflate_type = net_instaweb::GzipInflater::kGzip;
+    }
+
+    if (is_encoded) {
+      r->headers_out.content_encoding->hash = 0;
+      r->headers_out.content_encoding = NULL;
+      // TODO(oschaaf): log a single warning about this.
+      fprintf(stderr, "cleared content encoding header\n");
+      ctx->inflater_ = new net_instaweb::GzipInflater(inflate_type);
+      ctx->inflater_->Init();
+    }
   }
 
   const net_instaweb::RewriteOptions* options = ctx->driver->options();
