@@ -53,6 +53,7 @@ extern "C" {
 #include "net/instaweb/public/version.h"
 #include "net/instaweb/util/public/google_message_handler.h"
 #include "net/instaweb/util/public/google_url.h"
+#include "net/instaweb/util/public/gzip_inflater.h"
 #include "pthread_shared_mem.h"
 #include "net/instaweb/util/public/query_params.h"
 #include "net/instaweb/util/public/string.h"
@@ -291,6 +292,7 @@ typedef struct {
   bool is_resource_fetch;
   bool sent_headers;
   bool write_pending;
+  net_instaweb::GzipInflater* inflater_;
 } ps_request_ctx_t;
 
 ngx_int_t ps_body_filter(ngx_http_request_t* r, ngx_chain_t* in);
@@ -720,6 +722,11 @@ void ps_release_request_context(void* data) {
   if (ctx->base_fetch != NULL) {
     ctx->base_fetch->Release();
     ctx->base_fetch = NULL;
+  }
+
+  if (ctx->inflater_ != NULL) {
+    delete ctx->inflater_;
+    ctx->inflater_ = NULL;
   }
 
   // Close the connection, delete the events attached with it, and free it to
@@ -1329,10 +1336,27 @@ void ps_send_to_pagespeed(ngx_http_request_t* r,
     cur->buf->last_buf = 0;
 
     CHECK(ctx->proxy_fetch != NULL);
-    ctx->proxy_fetch->Write(StringPiece(reinterpret_cast<char*>(cur->buf->pos),
-                                        cur->buf->last - cur->buf->pos),
-                            cfg_s->handler);
-
+    if (ctx->inflater_ == NULL) {
+      ctx->proxy_fetch->Write(
+          StringPiece(reinterpret_cast<char*>(cur->buf->pos),
+                      cur->buf->last - cur->buf->pos), cfg_s->handler);
+    } else {
+      // TODO(oschaaf): get stack buffer size
+      size_t kStackBufferSize = 1024*8;
+      char buf[kStackBufferSize];
+      ctx->inflater_->SetInput(
+          reinterpret_cast<char*>(cur->buf->pos),
+          cur->buf->last - cur->buf->pos);
+      while (ctx->inflater_->HasUnconsumedInput()) {
+        int num_inflated_bytes =
+            ctx->inflater_->InflateBytes(buf, kStackBufferSize);
+        DCHECK_LE(0, num_inflated_bytes) << "Corrupted zip inflation";
+        if (num_inflated_bytes > 0) {
+          ctx->proxy_fetch->Write(StringPiece(buf, num_inflated_bytes),
+                                  cfg_s->handler);
+        }
+      }
+    }
     // We're done with buffers as we pass them through, so mark them as sent as
     // we go.
     cur->buf->pos = cur->buf->last;
@@ -1521,6 +1545,17 @@ ngx_int_t ps_header_filter(ngx_http_request_t* r) {
   }
   ctx = ps_get_request_context(r);
   CHECK(ctx->driver != NULL);  // Not a resource fetch, so driver is defined.
+
+  if (r->headers_out.content_encoding &&
+      r->headers_out.content_encoding->value.len) {
+    r->headers_out.content_encoding->hash = 0;
+    // TODO(oschaaf): log a single warning about this.
+    fprintf(stderr, "cleared content encoding header\n");
+    ctx->inflater_ = new net_instaweb::GzipInflater(
+        net_instaweb::GzipInflater::kDeflate);
+    ctx->inflater_->Init();
+  }
+
   const net_instaweb::RewriteOptions* options = ctx->driver->options();
 
   ps_strip_html_headers(r);
