@@ -1563,8 +1563,6 @@ ngx_int_t ps_header_filter(ngx_http_request_t* r) {
     if (is_encoded) {
       r->headers_out.content_encoding->hash = 0;
       r->headers_out.content_encoding = NULL;
-      // TODO(oschaaf): log a single warning about this.
-      fprintf(stderr, "cleared content encoding header\n");
       ctx->inflater_ = new net_instaweb::GzipInflater(inflate_type);
       ctx->inflater_->Init();
     }
