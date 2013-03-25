@@ -207,7 +207,6 @@ class NgxRewriteDriverFactory : public RewriteDriverFactory {
   scoped_ptr<QueuedWorkerPool> memcached_pool_;
   std::vector<AprMemCache*> memcache_servers_;
   std::vector<AsyncCache*> async_caches_;
-  bool threads_started_;
   // If true, we'll have a separate statistics object for each vhost
   // (along with a global aggregate), rather than just a single object
   // aggregating all of them.
@@ -220,6 +219,8 @@ class NgxRewriteDriverFactory : public RewriteDriverFactory {
   scoped_ptr<SharedCircularBuffer> shared_circular_buffer_;
   scoped_ptr<SharedMemStatistics> shared_mem_statistics_;
   bool statistics_frozen_;
+  ngx_connection_t *scheduler_timer_conn_;
+  static void scheduler_timer_handler(ngx_event_t *ev);
 
   DISALLOW_COPY_AND_ASSIGN(NgxRewriteDriverFactory);
 };
