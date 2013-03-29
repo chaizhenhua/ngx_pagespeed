@@ -98,8 +98,7 @@ NgxRewriteDriverFactory::NgxRewriteDriverFactory()
       install_crash_handler_(false),
       message_buffer_size_(0),
       shared_circular_buffer_(NULL),
-      statistics_frozen_(false),
-      scheduler_timer_conn_(NULL){
+      statistics_frozen_(false) {
   timer_ = DefaultTimer();
   InitializeDefaultOptions();
   default_options()->set_beacon_url("/ngx_pagespeed_beacon");
@@ -486,17 +485,6 @@ void NgxRewriteDriverFactory::ChildInit(ngx_log_t* log) {
       abort();
     }
   }
-
-  if (scheduler_timer_conn_ == NULL) {
-    scheduler_timer_conn_ = ngx_get_connection(-2, log);
-    if (scheduler_timer_conn_ == NULL) {
-      message_handler()->Message(kError, "Failed to get scheduler connection, abort");
-      abort();
-    }
-    scheduler_timer_conn_->data = this;
-    scheduler_timer_conn_->read->handler = scheduler_timer_handler;
-    ngx_add_timer(scheduler_timer_conn_->read, 0);
-  }
 }
 
 // Initializes global statistics object if needed, using factory to
@@ -548,29 +536,4 @@ void NgxRewriteDriverFactory::InitStats(Statistics* statistics) {
   statistics->AddVariable(kShutdownCount);
 }
 
-
-static void NgxRewriteDriverFactory::scheduler_timer_handler(ngx_event_t *ev) {
-  ngx_connection_t *connection = static_cast<ngx_connection_t *>(ev->data);
-  NgxRewriteDriverFactory *driver_factory = static_cast<NgxRewriteDriverFactory *>(connection->data);
-  Scheduler *scheduler = driver_factory->scheduler();
-
-  if (ev->timedout) {
-    bool run = false;
-    int64 next_wakeup_us;
-    
-    ScopedMutex lock(scheduler->mutex());
-  
-    // TODO: RunAlarms should not block. how to notify timer_handler, when AddAlarm is called
-    next_wakeup_us = scheduler->RunAlarms(&run);
-  
-    if (next_wakeup_us == 0 && (ngx_terminate || ngx_exiting) ) {
-    	ngx_del_timer(ev);
-      return;
-    }
-
-    // if timer == 0, the handler will be called in next event loop
-    ngx_msec_t timer = next_wakeup_us ? next_wakeup_us / Timer::kMsUs : 0;
-    ngx_add_timer(ev, timer);
-  }
-}
 }  // namespace net_instaweb

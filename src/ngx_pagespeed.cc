@@ -262,6 +262,7 @@ namespace {
 typedef struct {
   net_instaweb::NgxRewriteDriverFactory* driver_factory;
   net_instaweb::MessageHandler* handler;
+  ngx_event_t scheduler;
 } ps_main_conf_t;
 
 typedef struct {
@@ -1642,6 +1643,7 @@ ngx_int_t ps_header_filter(ngx_http_request_t* r) {
   return ngx_http_next_header_filter(r);
 }
 
+
 // TODO(oschaaf): make ps_static_handler use write_handler_response? for now,
 // minimize the diff
 ngx_int_t ps_static_handler(ngx_http_request_t* r) {
@@ -2106,6 +2108,19 @@ ngx_int_t ps_init_module(ngx_cycle_t* cycle) {
   return NGX_OK;
 }
 
+
+void ps_scheduler_handler(ngx_event_t *ev) {
+  net_instaweb::NgxRewriteDriverFactory* driver_factory = 
+  	static_cast<net_instaweb::NgxRewriteDriverFactory*>(ev->data);
+  net_instaweb::Scheduler *scheduler = driver_factory->scheduler();
+ 
+  if (scheduler->mutex()->TryLock()) {
+    scheduler->ProcessAlarms(0);
+    scheduler->mutex()->Unlock();
+  }
+  ngx_post_event(ev, &ngx_posted_events);
+}
+
 // Called when nginx forks worker processes.  No threads should be started
 // before this.
 ngx_int_t ps_init_child_process(ngx_cycle_t* cycle) {
@@ -2138,9 +2153,14 @@ ngx_int_t ps_init_child_process(ngx_cycle_t* cycle) {
           new net_instaweb::ProxyFetchFactory(cfg_s->server_context);
     }
   }
+  cfg_m->scheduler.log = cycle->log;
+  cfg_m->scheduler.prev = NULL;
+  cfg_m->scheduler.next = NULL;
+  cfg_m->scheduler.handler = ps_scheduler_handler;
+  cfg_m->scheduler.data = static_cast<void *>(cfg_m->driver_factory);
 
-  cfg_m->driver_factory->StartThreads();
-
+  ngx_event_t *ev = &cfg_m->scheduler;
+  ngx_post_event(ev, &ngx_posted_events);
   return NGX_OK;
 }
 
