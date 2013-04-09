@@ -134,8 +134,7 @@ class NgxBaseFetch : public AsyncFetch {
   int references_;
   pthread_mutex_t mutex_;
 
-  // TODO: atomic
-  int pending_signals_;
+  ngx_atomic_t pending_signals_;
   static NgxBaseFetchEvent* signaler_;
 
   DISALLOW_COPY_AND_ASSIGN(NgxBaseFetch);

@@ -29,7 +29,7 @@ namespace net_instaweb {
 NgxBaseFetch::NgxBaseFetch(ngx_http_request_t* r, int pipe_fd,
                            const RequestContextPtr& request_ctx)
     : AsyncFetch(request_ctx), request_(r), done_called_(false),
-      last_buf_sent_(false), pipe_fd_(pipe_fd), references_(2) {
+      last_buf_sent_(false), pipe_fd_(pipe_fd), references_(2), pending_signals_(0) {
   if (pthread_mutex_init(&mutex_, NULL)) CHECK(0);
   PopulateRequestHeaders();
 }
@@ -131,8 +131,13 @@ ngx_int_t NgxBaseFetch::CopyBufferToNginx(ngx_chain_t** link_ptr) {
 // and Done() such that we're sending an empty buffer with last_buf set, which I
 // think nginx will reject.
 ngx_int_t NgxBaseFetch::CollectAccumulatedWrites(ngx_chain_t** link_ptr) {
-  Lock();
+  if (pending_signals_ == 0) {
+  	*link_ptr = NULL;
+  	return NGX_OK;
+  }
+
   pending_signals_ = 0;
+  Lock();
 
   ngx_int_t rc = CopyBufferToNginx(link_ptr);
   Unlock();
@@ -147,15 +152,16 @@ ngx_int_t NgxBaseFetch::CollectAccumulatedWrites(ngx_chain_t** link_ptr) {
 ngx_int_t NgxBaseFetch::CollectHeaders(ngx_http_headers_out_t* headers_out) {
   Lock();
   const ResponseHeaders* pagespeed_headers = response_headers();
-  pending_signals_ --;
   Unlock();
+  ngx_atomic_fetch_add(&pending_signals_ , -1);
   return ngx_psol::copy_response_headers_to_ngx(request_, *pagespeed_headers);
 }
 
 void NgxBaseFetch::RequestCollection() {
-  if (pending_signals_) {
+  if (ngx_atomic_fetch_add(&pending_signals_ , 1)) {
     return;
   }
+
   signaler_->Signal(request_);
 }
 
