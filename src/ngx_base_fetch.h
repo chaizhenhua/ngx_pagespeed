@@ -51,10 +51,24 @@ extern "C" {
 
 namespace net_instaweb {
 
+class NgxBaseFetchEvent
+{
+public:
+    explicit NgxBaseFetchEvent(ngx_cycle_t *cycle);
+    ~NgxBaseFetchEvent();
+private:
+    void Signal(ngx_http_request_t *r);
+    static void EventHandler(ngx_event_t *ev);
+private:
+    int writefd_;
+    int readfd_;
+    ngx_log_t *log_;
+};
+
+
 class NgxBaseFetch : public AsyncFetch {
  public:
-  NgxBaseFetch(ngx_http_request_t* r, int pipe_fd,
-               const RequestContextPtr& request_ctx);
+  NgxBaseFetch(ngx_http_request_t* r, const RequestContextPtr& request_ctx);
   virtual ~NgxBaseFetch();
 
   // Copies the request headers out of request_->headers_in->headers.
@@ -115,11 +129,14 @@ class NgxBaseFetch : public AsyncFetch {
   GoogleString buffer_;
   bool done_called_;
   bool last_buf_sent_;
-  int pipe_fd_;
   // How many active references there are to this fetch. Starts at two,
   // decremented once when Done() is called and once when Release() is called.
   int references_;
   pthread_mutex_t mutex_;
+
+  // TODO: atomic
+  int pending_signals_;
+  static NgxBaseFetchEvent* signaler_;
 
   DISALLOW_COPY_AND_ASSIGN(NgxBaseFetch);
 };

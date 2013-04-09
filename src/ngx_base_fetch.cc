@@ -132,6 +132,8 @@ ngx_int_t NgxBaseFetch::CopyBufferToNginx(ngx_chain_t** link_ptr) {
 // think nginx will reject.
 ngx_int_t NgxBaseFetch::CollectAccumulatedWrites(ngx_chain_t** link_ptr) {
   Lock();
+  pending_signals_ = 0;
+
   ngx_int_t rc = CopyBufferToNginx(link_ptr);
   Unlock();
 
@@ -145,26 +147,16 @@ ngx_int_t NgxBaseFetch::CollectAccumulatedWrites(ngx_chain_t** link_ptr) {
 ngx_int_t NgxBaseFetch::CollectHeaders(ngx_http_headers_out_t* headers_out) {
   Lock();
   const ResponseHeaders* pagespeed_headers = response_headers();
+  pending_signals_ --;
   Unlock();
   return ngx_psol::copy_response_headers_to_ngx(request_, *pagespeed_headers);
 }
 
 void NgxBaseFetch::RequestCollection() {
-  int rc;
-  char c = 'A';  // What byte we write is arbitrary.
-  while (true) {
-    rc = write(pipe_fd_, &c, 1);
-    if (rc == 1) {
-      break;
-    } else if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-      // TODO(jefftk): is this rare enough that spinning isn't a problem?  Could
-      // we get into a case where the pipe fills up and we spin forever?
-
-    } else {
-      perror("NgxBaseFetch::RequestCollection");
-      break;
-    }
+  if (pending_signals_) {
+    return;
   }
+  signaler_->Signal(request_);
 }
 
 void NgxBaseFetch::HandleHeadersComplete() {
@@ -194,10 +186,84 @@ void NgxBaseFetch::HandleDone(bool success) {
   done_called_ = true;
   Unlock();
 
-  close(pipe_fd_);  // Indicates to nginx that we're done with the rewrite.
-  pipe_fd_ = -1;
-
   DecrefAndDeleteIfUnreferenced();
+}
+
+NgxBaseFetchEvent::NgxBaseFetchEvent(ngx_log_t *cycle) : log_(cycle->log) {
+    int fds[2];
+    if (::pipe(fds) != 0) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno, "pipe() failed");
+        fds[0] = fds[1] = -1;
+        /* fatal */
+        exit(2);
+    }
+    readfd_ = fds[1];
+
+    if (ngx_nonblocking(readfd_) == -1) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_socket_errno,
+                      ngx_nonblocking_n " pipe[0] failed");
+        /* fatal */
+        exit(2);
+    }
+
+    if (ngx_add_channel_event(cycle, readfd_, NGX_READ_EVENT, EventHandler) == NGX_ERROR ) {
+        /* fatal */
+        exit(2);
+    }
+}
+
+NgxBaseFetchEvent::~NgxBaseFetchEvent() {
+    ngx_close_channel(&writefd_, log_);
+}
+
+void NgxBaseFetchEvent::Signal(ngx_http_request_t *r) {
+    ngx_int_t rc = 0;
+    while (rc != sizeof(ngx_http_request_t *)) {
+        rc = write(writefd_, static_cast<void *>(&r), sizeof(ngx_http_request_t *));
+    }
+}
+
+void NgxBaseFetchEvent::EventHandler(ngx_event_t *ev) {
+    ngx_int_t		   n;
+    ngx_channel_t	   ch;
+    ngx_connection_t  *c;
+    ngx_int_t          rc;
+    ngx_uint_t         i;
+
+    if (ev->timedout) {
+        ev->timedout = 0;
+        return;
+    }
+
+    c = ev->data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, ev->log, 0, "channel handler");
+
+    for ( ;; ) {
+        // TODO: PIPE_BUF_SIZE
+        ngx_http_request_t **requests[512];
+        rc = read(c->fd, static_cast<void *>(requests), sizeof(requests));
+
+        if (rc == -1) {
+            if (ngx_errno == EINTR) {
+                continue;
+            } else if (ngx_errno == EAGAIN) {
+                break;
+            }
+
+            // NGX_ERROR
+            if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {
+                ngx_del_conn(c, 0);
+            }
+
+            ngx_close_connection(c);
+            break;
+        }
+
+        for (i = 0; i < rc / sizeof(ngx_http_request_t *); i++) {
+            ngx_psol::process_base_fetch_output(requests[i]);
+        }
+    }
 }
 
 }  // namespace net_instaweb
