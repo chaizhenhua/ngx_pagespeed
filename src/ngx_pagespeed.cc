@@ -2099,26 +2099,79 @@ ngx_int_t ps_messages_handler(
   return NGX_OK;
 }
 
-ngx_int_t
-ps_beacon_handler(ngx_http_request_t* r) {
+void
+ps_beacon_post_handler(ngx_http_request_t* r) {
   ps_srv_conf_t* cfg_s = ps_get_srv_config(r);
   CHECK(cfg_s != NULL);
 
+  if (r->request_body) {
+  	// TODO:
+  }
+  
   StringPiece user_agent;
   if (r->headers_in.user_agent != NULL) {
-    user_agent = str_to_string_piece(r->headers_in.user_agent->value);
+	user_agent = str_to_string_piece(r->headers_in.user_agent->value);
   }
-
+  
   cfg_s->server_context->HandleBeacon(
-      str_to_string_piece(r->unparsed_uri),
-      user_agent,
-      net_instaweb::RequestContextPtr(new net_instaweb::NgxRequestContext(
-          cfg_s->server_context->thread_system()->NewMutex(), r)));
-
+	  str_to_string_piece(r->unparsed_uri),
+	  user_agent,
+	  net_instaweb::RequestContextPtr(new net_instaweb::NgxRequestContext(
+		  cfg_s->server_context->thread_system()->NewMutex(), r)));
+  
   // TODO(jefftk): figure out how to insert Content-Length:0 as a response
   // header so wget doesn't hang.
+  ngx_http_finalize_request(r, NGX_HTTP_NO_CONTENT);
+}
 
-  return NGX_HTTP_NO_CONTENT;
+
+ngx_int_t
+ps_beacon_handler(ngx_http_request_t* r) {
+
+  ps_srv_conf_t* cfg_s = ps_get_srv_config(r);
+  CHECK(cfg_s != NULL);
+
+  if (r->method == NGX_HTTP_GET) {
+	  
+	  StringPiece user_agent;
+	  if (r->headers_in.user_agent != NULL) {
+		user_agent = str_to_string_piece(r->headers_in.user_agent->value);
+	  }
+	  
+	  cfg_s->server_context->HandleBeacon(
+		  str_to_string_piece(r->unparsed_uri),
+		  user_agent,
+		  net_instaweb::RequestContextPtr(new net_instaweb::NgxRequestContext(
+			  cfg_s->server_context->thread_system()->NewMutex(), r)));
+	  
+	  // TODO(jefftk): figure out how to insert Content-Length:0 as a response
+	  // header so wget doesn't hang.
+	  
+	  return NGX_HTTP_NO_CONTENT;
+
+  } else if (r->method == NGX_HTTP_POST) {
+    if (r->headers_in.content_type == NULL 
+		|| ngx_strncasecmp("application/x-www-form-urlencoded",
+		r->headers_in.content_type.value.data, r->headers_in.content_type.value.len) )
+      return NGX_HTTP_BAD_REQUEST;
+    }
+
+	// copy from instaweb_handler.cc see parse_body_from_post
+	static const size_t kMaxPostSizeBytes = 131072;
+	if (r->headers_in.content_length_n != -1 
+		&& r->headers_in.content_length_n > kMaxPostSizeBytes) {
+      return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+	}
+
+    ngx_int_t rc = ngx_http_read_client_request_body(r, ps_beacon_post_handler);
+	if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+      return rc;
+	}
+	 
+	return NGX_DONE;
+  } else {
+    return NGX_HTTP_NOT_ALLOWED;
+  }
 }
 
 // Handle requests for resources like example.css.pagespeed.ce.LyfcM6Wulf.css
