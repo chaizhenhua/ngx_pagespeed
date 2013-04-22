@@ -758,7 +758,9 @@ void ps_release_request_context(void* data) {
     close(ctx->pipe_fd);
   }
 
-  delete ctx;
+  if (ctx->header_in) {
+    ctx->r->header_in = ctx->header_in;
+  }
 }
 
 // Tell nginx whether we have network activity we're waiting for so that it sets
@@ -2391,6 +2393,8 @@ void ps_beacon_body_handler(ngx_http_request_t* r) {
   ngx_http_finalize_request(r, rc);
 }
 
+const size_t kMaxPostSizeBytes = 131072;
+
 ngx_int_t ps_beacon_handler(ngx_http_request_t* r) {
   if (r->method == NGX_HTTP_POST) {
     // Use post body. Handler functions are called before the request body has
@@ -2399,12 +2403,43 @@ ngx_int_t ps_beacon_handler(ngx_http_request_t* r) {
     // ps_beacon_body_handler unless there's an error reading the request body.
     //
     // See: http://forum.nginx.org/read.php?2,31312,31312
+    if (r->headers_in.content_length_n > kMaxPostSizeBytes) {
+      return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+    }
+
+    
+	ngx_http_core_loc_conf_t *clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+	
+    size_t size = clcf->client_body_buffer_size;
+    size += size >> 2;
+
+	size_t preread = r->header_in->last - r->header_in->pos;
+    if (r->headers_in.content_length_n <= (off_t)preread 
+		  || r->headers_in.content_length_n <= preread + size) {
+      // Do nothing
+	} else {
+	  ngx_buf_t *buf = ngx_create_temp_buf(r->pool, r->headers_in.content_length_n);
+	  if (buf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	  }
+
+	  ngx_memcpy(buf->last, r->header_in->pos, preread);
+	  buf->last += preread;
+	  
+	  r->header_in.last = r->header_in.pos = r->header_in.end;
+
+	  ctx->header_in = r->header_in;
+	  r->headers_in = buf;
+	}
+
+    r->request_body_in_single_buf = 1;
+	
     ngx_int_t rc = ngx_http_read_client_request_body(r, ps_beacon_body_handler);
     if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
       return rc;
     }
     return NGX_DONE;
-  } else {
+  } else if (r->method == NGX_HTTP_GET){
     // Use query params.
     StringPiece beacon_data;
     StringPiece unparsed_uri = str_to_string_piece(r->unparsed_uri);
@@ -2417,6 +2452,7 @@ ngx_int_t ps_beacon_handler(ngx_http_request_t* r) {
     }
     return ps_beacon_handler_helper(r, beacon_data);
   }
+  return NGX_HTTP_NOT_ALLOWED;
 }
 
 // Handle requests for resources like example.css.pagespeed.ce.LyfcM6Wulf.css
@@ -2428,40 +2464,177 @@ ngx_int_t ps_content_handler(ngx_http_request_t* r) {
     return NGX_DECLINED;
   }
 
+  if (!cfg_s->server_context->global_options()->enabled()) {
+    // Not enabled for this server block.
+    return NGX_DECLINED;
+  }
+
+
   // Poll for cache flush on every request (polls are rate-limited).
   cfg_s->server_context->FlushCacheIfNecessary();
 
   ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                  "http pagespeed handler \"%V\"", &r->uri);
 
-  switch (ps_create_request_context(
-      r, true /* is a resource fetch */)) {
-    case CreateRequestContext::kError:
-      return NGX_ERROR;
-    case CreateRequestContext::kNotUnderstood:
-    case CreateRequestContext::kPagespeedDisabled:
-    case CreateRequestContext::kInvalidUrl:
-    case CreateRequestContext::kPagespeedSubrequest:
-    case CreateRequestContext::kNotHeadOrGet:
-    case CreateRequestContext::kErrorResponse:
-      return NGX_DECLINED;
-    case CreateRequestContext::kBeacon:
-      return ps_beacon_handler(r);
-    case CreateRequestContext::kStaticContent:
-      return ps_static_handler(r);
-    case CreateRequestContext::kStatistics:
-      return ps_statistics_handler(r, cfg_s->server_context);
-    case CreateRequestContext::kMessages:
-      return ps_messages_handler(r, cfg_s->server_context);
-    case CreateRequestContext::kOk:
-      break;
+  ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(r->pool, sizeof(ps_request_ctx_t));
+  if (cln == NULL) {
+    return NGX_DECLINED;
+  }
+  
+  ngx_http_set_ctx(r, ctx, ngx_pagespeed);
+
+  ngx_memzero(cln->data, sizeof(ps_request_ctx_t));
+  
+  ps_request_ctx_t *ctx = static_cast<ps_request_ctx_t *>(cln->data);
+  ctx->r = r;
+
+  GoogleString url_string = ps_determine_url(r);
+
+  net_instaweb::GoogleUrl url(url_string);
+
+  if (!url.is_valid()) {
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "invalid url");
+
+    // Let nginx deal with the error however it wants; we will see a NULL ctx in
+    // the body filter or content handler and do nothing.
+    return NGX_DECLINED;
   }
 
-  ps_request_ctx_t* ctx = ps_get_request_context(r);
-  CHECK(ctx != NULL);
+  if (is_pagespeed_subrequest(r)) {
+    return NGX_DECLINED;
+  }
 
-  // generic checker will not finalize request
-  // so do not need increase r->count here
+  // TODO: (chaizhenhua)use nginx location to handle this ?
+  if (url.PathSansLeaf() ==
+      net_instaweb::NgxRewriteDriverFactory::kStaticAssetPrefix) {
+    return ps_static_handler(r);
+  }
+  if (url.PathSansQuery() == "/ngx_pagespeed_statistics"
+      || url.PathSansQuery() == "/ngx_pagespeed_global_statistics" ) {
+    return ps_statistics_handler(r, cfg_s->server_context);
+  }
+  if (url.PathSansQuery() == "/ngx_pagespeed_message") {
+	return ps_messages_handler(r, cfg_s->server_context);
+  }
+
+  net_instaweb::RewriteOptions* global_options =
+      cfg_s->server_context->global_options();
+
+  const GoogleString* beacon_url;
+  if (ps_is_https(r)) {
+    beacon_url = &(global_options->beacon_url().https);
+  } else {
+    beacon_url = &(global_options->beacon_url().http);
+  }
+
+  if (url.PathSansQuery() == StringPiece(*beacon_url)) {
+    return ps_beacon_handler(r);
+  }
+
+  // do resource fetch
+  if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
+    return NGX_DECLINED;
+  }
+
+  if (!cfg_s->server_context->IsPagespeedResource(url)) {
+    DBG(r, "Passing on content handling for non-pagespeed resource '%s'",
+        url_string.c_str());
+    return NGX_DECLINED;
+  }
+
+  int file_descriptors[2];
+  int rc = pipe(file_descriptors);
+  if (rc != 0) {
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "pipe() failed");
+    return NGX_DECLINED;
+  }
+
+  if (ngx_nonblocking(file_descriptors[0]) == -1) {
+    ngx_log_error(NGX_LOG_EMERG, r->connection->log, ngx_socket_errno,
+                  ngx_nonblocking_n " pipe[0] failed");
+    return NGX_DECLINED;
+  }
+
+  if (ngx_nonblocking(file_descriptors[1]) == -1) {
+    ngx_log_error(NGX_LOG_EMERG, r->connection->log, ngx_socket_errno,
+                  ngx_nonblocking_n " pipe[1] failed");
+    return NGX_DECLINED;
+  }
+
+  ctx->r = r;
+  ctx->pipe_fd = file_descriptors[0];
+  ctx->is_resource_fetch = true;
+
+  rc = ps_create_connection(ctx);
+  if (rc != NGX_OK) {
+    close(file_descriptors[1]);
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                  "ps_create_request_context: "
+                  "no pagespeed connection.");
+    ps_release_request_context(ctx);
+    return NGX_DECLINED;
+  }
+
+  // Handles its own deletion.  We need to call Release() when we're done with
+  // it, and call Done() on the associated parent (Proxy or Resource) fetch.  If
+  // we fail before creating the associated fetch then we need to call Done() on
+  // the BaseFetch ourselves.
+  ctx->base_fetch = new net_instaweb::NgxBaseFetch(
+      r, file_descriptors[1],
+      cfg_s->server_context,
+      net_instaweb::RequestContextPtr(new net_instaweb::NgxRequestContext(
+          cfg_s->server_context->thread_system()->NewMutex(), r)));
+
+  // If null, that means use global options.
+  net_instaweb::RewriteOptions* custom_options = NULL;
+  bool ok = ps_determine_options(r, ctx, &custom_options, &url);
+  if (!ok) {
+    ctx->base_fetch->Done(false);  // Not passed to Proxy/ResourceFetch yet.
+    return NGX_DECLINED;
+  }
+
+  // ps_determine_options modified url, removing any ModPagespeedFoo=Bar query
+  // parameters.  Keep url_string in sync with url.
+  url.Spec().CopyToString(&url_string);
+
+  net_instaweb::RewriteOptions* options;
+  if (custom_options == NULL) {
+    options = cfg_s->server_context->global_options();
+  } else {
+    options = custom_options;
+  }
+
+  if (!options->enabled()) {
+    // Disabled via query params or request headers.
+
+    ctx->base_fetch->Done(false);  // Not passed to Proxy/ResourceFetch yet.
+    return NGX_DECLINED;
+  }
+
+  if (options->respect_x_forwarded_proto()) {
+    bool modified_url = ps_apply_x_forwarded_proto(r, &url_string);
+    if (modified_url) {
+      url.Reset(url_string);
+      CHECK(url.is_valid()) << "The output of ps_apply_x_forwarded_proto should"
+                            << " always be a valid url because it only changes"
+                            << " the scheme between http and https.";
+    }
+  }
+
+  bool page_callback_added = false;
+  scoped_ptr<net_instaweb::ProxyFetchPropertyCallbackCollector>
+      property_callback(ps_initiate_property_cache_lookup(
+          cfg_s->server_context,
+          true, url, options, ctx->base_fetch,
+          &page_callback_added));
+
+    // TODO(jefftk): Set using_spdy appropriately.  See
+    // ProxyInterface::ProxyRequestCallback
+    net_instaweb::ResourceFetch::Start(
+        url, custom_options /* null if there aren't custom options */,
+        false /* using_spdy */, cfg_s->server_context, ctx->base_fetch);
+
   return NGX_DONE;
 }
 
