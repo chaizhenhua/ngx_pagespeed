@@ -85,6 +85,8 @@ class NgxBaseFetch : public AsyncFetch {
   // Called by nginx when it's done with us.
   void Release();
 
+  bool Finashed() const;
+
  private:
   virtual bool HandleWrite(const StringPiece& sp, MessageHandler* handler);
   virtual bool HandleFlush(MessageHandler* handler);

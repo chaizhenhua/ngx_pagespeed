@@ -195,6 +195,10 @@ void NgxBaseFetch::Release() {
   DecrefAndDeleteIfUnreferenced();
 }
 
+bool NgxBaseFetch::Finashed() const {
+  return done_called_;
+}
+
 void NgxBaseFetch::DecrefAndDeleteIfUnreferenced() {
   // Creates a full memory barrier.
   if (__sync_add_and_fetch(&references_, -1) == 0) {
