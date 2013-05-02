@@ -25,6 +25,14 @@
 
 #include "ngx_pagespeed.h"
 
+extern "C" {
+  #include <ngx_config.h>
+  #include <ngx_core.h>
+  #include <ngx_http.h>
+  #include <ngx_log.h>
+}
+
+#include <unistd.h>
 #include <vector>
 #include <set>
 
@@ -34,7 +42,6 @@
 #include "ngx_rewrite_driver_factory.h"
 #include "ngx_rewrite_options.h"
 #include "ngx_server_context.h"
-#include "ngx_thread_system.h"
 
 #include "apr_time.h"
 
@@ -583,8 +590,7 @@ void* ps_create_main_conf(ngx_conf_t* cf) {
   net_instaweb::NgxRewriteOptions::Initialize();
   net_instaweb::NgxRewriteDriverFactory::Initialize();
 
-  cfg_m->driver_factory = new net_instaweb::NgxRewriteDriverFactory(
-      new net_instaweb::NgxThreadSystem());
+  cfg_m->driver_factory = new net_instaweb::NgxRewriteDriverFactory();
   ps_set_conf_cleanup_handler(cf, ps_cleanup_main_conf, cfg_m);
   return cfg_m;
 }
@@ -750,10 +756,6 @@ void ps_release_request_context(void* data) {
 
   if (ctx->pipe_fd != -1) {
     close(ctx->pipe_fd);
-  }
-
-  if (ctx->header_in) {
-    ctx->r->header_in = ctx->header_in;
   }
 
   delete ctx;
@@ -1528,6 +1530,7 @@ CreateRequestContext::Response ps_create_request_context(
   rc = ps_create_connection(ctx);
   if (rc != NGX_OK) {
     close(file_descriptors[1]);
+
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                   "ps_create_request_context: "
                   "no pagespeed connection.");
@@ -1543,8 +1546,7 @@ CreateRequestContext::Response ps_create_request_context(
       r, file_descriptors[1],
       cfg_s->server_context,
       net_instaweb::RequestContextPtr(new net_instaweb::NgxRequestContext(
-          cfg_s->server_context->thread_system()->NewMutex(),
-          cfg_s->server_context->timer(), r)));
+          cfg_s->server_context->thread_system()->NewMutex(), r)));
 
   // If null, that means use global options.
   net_instaweb::RewriteOptions* custom_options = NULL;
@@ -2272,7 +2274,7 @@ ngx_int_t ps_messages_handler(
   return NGX_OK;
 }
 
-void ps_beacon_handler_helper(ngx_http_request_t* r,
+ngx_int_t ps_beacon_handler_helper(ngx_http_request_t* r,
                                    StringPiece beacon_data) {
   ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                 "ps_beacon_handler_helper: beacon[%d] %*s",
@@ -2291,34 +2293,102 @@ void ps_beacon_handler_helper(ngx_http_request_t* r,
       beacon_data,
       user_agent,
       net_instaweb::RequestContextPtr(new net_instaweb::NgxRequestContext(
-          cfg_s->server_context->thread_system()->NewMutex(),
-          cfg_s->server_context->timer(), r)));
+          cfg_s->server_context->thread_system()->NewMutex(), r)));
 
   // TODO(jefftk): figure out how to insert Content-Length:0 as a response
   // header so wget doesn't hang.
+
+  return NGX_HTTP_NO_CONTENT;
+}
+
+
+// Load the request body into out.  ngx_http_read_client_request_body must
+// already have been called.  Return false on failure, true on success.
+bool ps_request_body_to_string_piece(
+    ngx_http_request_t* r, StringPiece* out) {
+  if (r->request_body == NULL || r->request_body->bufs == NULL) {
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                  "ps_request_body_to_string_piece: "
+                  "empty request body.");
+    return false;
+  }
+
+  if (r->request_body->temp_file) {
+    // For now raise an error instead of figuring out how to read temporary
+    // files.
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                  "ps_request_body_to_string_piece: "
+                  "request body in temporary file unsupported."
+                  "Increase client_body_buffer_size.");
+    return false;
+  } else if (r->request_body->bufs->next == NULL) {
+    // There's just one buffer, so we can simply return a StringPiece pointing
+    // to this buffer.
+    ngx_buf_t* buffer = r->request_body->bufs->buf;
+    CHECK(!buffer->in_file);
+    int len = buffer->last - buffer->pos;
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "ngx_pagespeed beacon: single buffer of %d", len);
+    *out = StringPiece(reinterpret_cast<char*>(buffer->pos), len);
+    return true;
+  } else {
+    // There are multiple buffers, so we need to allocate memory for a string to
+    // hold the whole result.  This should only happen when the POST is sent
+    // with "Transfer-Encoding: Chunked".
+
+    // First determine how much data there is.
+    int len = 0;
+    int buffers = 0;
+
+    ngx_chain_t* chain_link;
+    for (chain_link = r->request_body->bufs;
+         chain_link != NULL;
+         chain_link = chain_link->next) {
+      len += chain_link->buf->last - chain_link->buf->pos;
+      buffers++;
+    }
+
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "ngx_pagespeed beacon: %d buffers totalling %d", len);
+
+    // Allocate a string to store the combined result.
+    u_char* s = static_cast<u_char*>(ngx_palloc(r->pool, len));
+    if (s == NULL) {
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                    "ps_request_body_to_string_piece: "
+                    "failed to allocate memory");
+      return false;
+    }
+
+    // Copy the data into the combined string.
+    u_char* current_position = s;
+    int i;
+    for (chain_link = r->request_body->bufs, i = 0;
+         chain_link != NULL;
+         chain_link = chain_link->next, i++) {
+      ngx_buf_t* buffer = chain_link->buf;
+      CHECK(!buffer->in_file);
+      current_position = ngx_copy(current_position, buffer->pos,
+                                  buffer->last - buffer->pos);
+    }
+    CHECK_EQ(current_position, s + len);
+    *out = StringPiece(reinterpret_cast<char*>(s), len);
+    return true;
+  }
 }
 
 // Called after nginx reads the request body from the client.  For another
 // example processing request buffers, see ngx_http_form_input_module.c
 void ps_beacon_body_handler(ngx_http_request_t* r) {
-
-  if (r->request_body == NULL || r->request_body->buf == NULL) {
-    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-    return;
+  StringPiece request_body;
+  ngx_int_t rc;
+  bool ok = ps_request_body_to_string_piece(r, &request_body);
+  if (ok) {
+    rc = ps_beacon_handler_helper(r, request_body);
+  } else {
+    rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
-
-  ngx_buf_t *buf = r->request_body->buf;
-  StringPiece request_body(reinterpret_cast<char*>(buf->pos), ngx_buf_size(buf));
-
-  ps_beacon_handler_helper(r, request_body);
-  r->count--;
-  ngx_http_finalize_request(r, NGX_HTTP_NO_CONTENT);
-}
-
-void ps_recover_buffer(ngx_http_request_t *r) {
-  ps_request_ctx_t *ctx = ps_get_request_context(r);
-
-  r->header_in = ctx->header_in;
+  ngx_http_finalize_request(r, rc);
 }
 
 ngx_int_t ps_beacon_handler(ngx_http_request_t* r) {
@@ -2329,62 +2399,6 @@ ngx_int_t ps_beacon_handler(ngx_http_request_t* r) {
     // ps_beacon_body_handler unless there's an error reading the request body.
     //
     // See: http://forum.nginx.org/read.php?2,31312,31312
-
-    // copy from instaweb_handler.cc
-    static const off_t kMaxPostSizeBytes = 131072;
-
-    if (r->headers_in.content_length_n == -1) {
-      return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    if (r->headers_in.content_length_n > kMaxPostSizeBytes) {
-      return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
-    }
-
-    ngx_http_core_loc_conf_t *clcf = static_cast<ngx_http_core_loc_conf_t *>(
-                         ngx_http_get_module_loc_conf(r, ngx_http_core_module));
-
-    // can be read in single buffer ? see ngx_http_read_client_request_body
-    size_t preread = r->header_in->last - r->header_in->pos;
-    off_t rest = r->headers_in.content_length_n - preread;
-    ssize_t size = clcf->client_body_buffer_size;
-    size += size >> 2;
-
-    if (rest >= size) {
-      // can not read in single buffer,
-      // alloc new and recover r->header_in when finalize, see ps_release
-      ngx_buf_t *buf = ngx_create_temp_buf(r->pool, 
-                             r->headers_in.content_length_n);
-      if (buf == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-      }
-
-      ps_request_ctx_t *ctx = ps_get_request_context(r);
-      if (ctx == NULL) {
-        ps_request_ctx_t* ctx = new ps_request_ctx_t();
-        ctx->r = r;
-        ctx->pipe_fd = -1;
-        ctx->is_resource_fetch = false;
-        ctx->write_pending = false;
-        ctx->pagespeed_connection = NULL;
-        ngx_http_cleanup_t* cleanup = ngx_http_cleanup_add(r, 0);
-        if (cleanup == NULL) {
-          return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        cleanup->handler = ps_release_request_context;
-        cleanup->data = ctx;
-        ngx_http_set_ctx(r, ctx, ngx_pagespeed);
-      }
-
-      // copy preread
-      ngx_memcpy(buf->last, r->header_in->pos, preread);
-      buf->last += preread;
-
-      ctx->header_in = r->header_in; // for recover use
-      // read_client_request_body will check r->header_in first
-      r->header_in = buf;
-    }
-    r->request_body_in_file_only = 0;
-    r->request_body_in_single_buf = 1;
     ngx_int_t rc = ngx_http_read_client_request_body(r, ps_beacon_body_handler);
     if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
       return rc;
@@ -2401,8 +2415,7 @@ ngx_int_t ps_beacon_handler(ngx_http_request_t* r) {
       beacon_data = unparsed_uri.substr(
           question_mark_index+1, unparsed_uri.size() - (question_mark_index+1));
     }
-    ps_beacon_handler_helper(r, beacon_data);
-    return NGX_HTTP_NO_CONTENT;
+    return ps_beacon_handler_helper(r, beacon_data);
   }
 }
 
@@ -2647,7 +2660,7 @@ ngx_int_t ps_init_child_process(ngx_cycle_t* cycle) {
     }
   }
 
-  if (!cfg_m->driver_factory->InitNgxUrlAsyncFetcher()) {
+  if (!cfg_m->driver_factory->InitNgxUrlAsyncFecther()) {
     return NGX_ERROR;
   }
   cfg_m->driver_factory->StartThreads();

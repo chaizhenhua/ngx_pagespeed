@@ -25,6 +25,14 @@
 
 #include "ngx_pagespeed.h"
 
+extern "C" {
+  #include <ngx_config.h>
+  #include <ngx_core.h>
+  #include <ngx_http.h>
+  #include <ngx_log.h>
+}
+
+#include <unistd.h>
 #include <vector>
 #include <set>
 
@@ -34,7 +42,6 @@
 #include "ngx_rewrite_driver_factory.h"
 #include "ngx_rewrite_options.h"
 #include "ngx_server_context.h"
-#include "ngx_thread_system.h"
 
 #include "apr_time.h"
 
@@ -583,8 +590,7 @@ void* ps_create_main_conf(ngx_conf_t* cf) {
   net_instaweb::NgxRewriteOptions::Initialize();
   net_instaweb::NgxRewriteDriverFactory::Initialize();
 
-  cfg_m->driver_factory = new net_instaweb::NgxRewriteDriverFactory(
-      new net_instaweb::NgxThreadSystem());
+  cfg_m->driver_factory = new net_instaweb::NgxRewriteDriverFactory();
   ps_set_conf_cleanup_handler(cf, ps_cleanup_main_conf, cfg_m);
   return cfg_m;
 }
@@ -1528,6 +1534,7 @@ CreateRequestContext::Response ps_create_request_context(
   rc = ps_create_connection(ctx);
   if (rc != NGX_OK) {
     close(file_descriptors[1]);
+
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                   "ps_create_request_context: "
                   "no pagespeed connection.");
@@ -1543,8 +1550,7 @@ CreateRequestContext::Response ps_create_request_context(
       r, file_descriptors[1],
       cfg_s->server_context,
       net_instaweb::RequestContextPtr(new net_instaweb::NgxRequestContext(
-          cfg_s->server_context->thread_system()->NewMutex(),
-          cfg_s->server_context->timer(), r)));
+          cfg_s->server_context->thread_system()->NewMutex(), r)));
 
   // If null, that means use global options.
   net_instaweb::RewriteOptions* custom_options = NULL;
@@ -2291,8 +2297,7 @@ void ps_beacon_handler_helper(ngx_http_request_t* r,
       beacon_data,
       user_agent,
       net_instaweb::RequestContextPtr(new net_instaweb::NgxRequestContext(
-          cfg_s->server_context->thread_system()->NewMutex(),
-          cfg_s->server_context->timer(), r)));
+          cfg_s->server_context->thread_system()->NewMutex(), r)));
 
   // TODO(jefftk): figure out how to insert Content-Length:0 as a response
   // header so wget doesn't hang.
@@ -2352,8 +2357,7 @@ ngx_int_t ps_beacon_handler(ngx_http_request_t* r) {
     if (rest >= size) {
       // can not read in single buffer,
       // alloc new and recover r->header_in when finalize, see ps_release
-      ngx_buf_t *buf = ngx_create_temp_buf(r->pool, 
-                             r->headers_in.content_length_n);
+      ngx_buf_t *buf = ngx_create_temp_buf(r->pool, r->headers_in.content_length_n);
       if (buf == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
       }
@@ -2647,7 +2651,7 @@ ngx_int_t ps_init_child_process(ngx_cycle_t* cycle) {
     }
   }
 
-  if (!cfg_m->driver_factory->InitNgxUrlAsyncFetcher()) {
+  if (!cfg_m->driver_factory->InitNgxUrlAsyncFecther()) {
     return NGX_ERROR;
   }
   cfg_m->driver_factory->StartThreads();
