@@ -385,10 +385,11 @@ ngx_int_t ps_collect_send_response(ngx_http_request_t *r) {
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
   // rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DECLINED
-  if (rc == NGX_OK) {
-    ctx->fetch_done = true;
-    ps_set_buffered(ctx->r, false);
-  }
+
+  ctx->fetch_done = (rc == NGX_OK);
+
+
+  ps_set_buffered(ctx->r, !ctx->fetch_done);
 
   // send response body
   if (cl || ctx->write_pending) {
