@@ -1738,7 +1738,6 @@ ngx_int_t ps_body_filter(ngx_http_request_t* r, ngx_chain_t* in) {
 
   if (in != NULL) {
     // Send all input data to the proxy fetch.
-	ps_set_buffered(r, true);
     ps_send_to_pagespeed(r, ctx, cfg_s, in);
   }
 
@@ -1751,6 +1750,7 @@ ngx_int_t ps_body_filter(ngx_http_request_t* r, ngx_chain_t* in) {
 	return rc;
   }
 
+  ps_set_buffered(r, !ctx->fetch_done);
   return ctx->fetch_done ? NGX_OK : NGX_AGAIN;
 }
 
