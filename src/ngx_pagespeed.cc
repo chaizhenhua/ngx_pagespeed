@@ -919,7 +919,7 @@ ngx_int_t ps_async_wait_response(ngx_http_request_t *r) {
   r->count++;
   r->write_event_handler = ngx_http_request_empty_handler;
   ps_set_buffered(r, true);
-  // TODO(chaizhenhua): do we need timer here?
+  // We don't need to add a timer here, as it will be set by nginx.
   return NGX_DONE;
 }
 
@@ -1987,22 +1987,7 @@ ngx_int_t ps_header_filter(ngx_http_request_t* r) {
 
   const net_instaweb::RewriteOptions* options = ctx->driver->options();
   ps_strip_html_headers(r);
-
   ctx->modify_headers = options->modify_caching_headers();
-  if (ctx->modify_headers) {
-    // Don't cache html.  See mod_instaweb:instaweb_fix_headers_filter.
-    net_instaweb::NgxCachingHeaders caching_headers(r);
-    ps_set_cache_control(r, string_piece_to_pool_string(
-        r->pool, caching_headers.GenerateDisabledCacheControl()));
-
-    // Pagespeed html doesn't need etags: it should never be cached.
-    ngx_http_clear_etag(r);
-
-    // An html page may change without the underlying file changing, because of
-    // how resources are included.  Pagespeed adds cache control headers for
-    // resources instead of using the last modified header.
-    ngx_http_clear_last_modified(r);
-  }
 
   ps_set_buffered(r, true);
   r->filter_need_in_memory = 1;
@@ -2521,6 +2506,43 @@ ngx_int_t ps_phase_handler(ngx_http_request_t *r,
   return NGX_OK;
 }
 
+namespace fix_headers {
+ngx_http_output_header_filter_pt ngx_http_next_header_filter;
+
+ngx_int_t ps_html_rewrite_fix_headers_filter(ngx_http_request_t *r) {
+  ps_request_ctx_t *ctx = ps_get_request_context(r);
+  if (r != r->main || ctx == NULL || !ctx->modify_headers || ctx->is_resource_fetch) {
+    return ngx_http_next_header_filter(r);
+  }
+
+  // Don't cache html.	See mod_instaweb:instaweb_fix_headers_filter.
+  net_instaweb::NgxCachingHeaders caching_headers(r);
+  ps_set_cache_control(r, string_piece_to_pool_string(
+      r->pool, caching_headers.GenerateDisabledCacheControl()));
+
+  // Pagespeed html doesn't need etags: it should never be cached.
+  ngx_http_clear_etag(r);
+
+  // An html page may change without the underlying file changing, because of
+  // how resources are included.  Pagespeed adds cache control headers for
+  // resources instead of using the last modified header.
+  ngx_http_clear_last_modified(r);
+
+  // Clear expires
+  if (r->headers_out.expires) {
+    r->headers_out.expires->hash = 0;
+    r->headers_out.expires = NULL;
+  }
+
+  return ngx_http_next_header_filter(r);
+}
+}  // namespace fix_headers
+
+void ps_html_rewrite_fix_headers_filter_init() {
+  fix_headers::ngx_http_next_header_filter = ngx_http_top_header_filter;
+  ngx_http_top_header_filter = fix_headers::ps_html_rewrite_fix_headers_filter;
+}
+
 // preaccess_handler should be at generic phase before try_files
 ngx_int_t ps_preaccess_handler(ngx_http_request_t *r) {
   ngx_http_core_main_conf_t *cmcf;
@@ -2577,6 +2599,9 @@ ngx_int_t ps_init(ngx_conf_t* cf) {
   // filter, and content handler will run in every server block.  This is ok,
   // because they will notice that the server context is NULL and do nothing.
   if (cfg_m->driver_factory != NULL) {
+
+    ps_html_rewrite_fix_headers_filter_init();
+
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ps_header_filter;
 
